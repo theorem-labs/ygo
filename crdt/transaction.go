@@ -813,6 +813,13 @@ type boundedApplyState struct {
 	// (noteApplyReport, reportApply).
 	report    ApplyReport
 	reportDue bool
+	// drainRefused is the apply's error when the document's apply check
+	// refused what the drain landed and the drain was taken back while the
+	// update stands, and checkPanic is what the check panicked with, raised
+	// to the caller once the transaction has committed (checkDrain,
+	// runCheck).
+	drainRefused error
+	checkPanic   any
 }
 
 // beginBoundedApply returns txn's bounded apply state, made on first use.

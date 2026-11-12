@@ -33,7 +33,8 @@ import (
 // again from the drain); under a budget it draws on what the apply's allowance
 // has left, so one apply's scans, drain included, never pass what the budget
 // gave it. The scans of a drain taken back stay counted
-// (Transaction.IntegrateScanned): the work was done.
+// (Transaction.IntegrateScanned): the work was done. A drain whose result the
+// document's apply check refuses (WithApplyCheck) is taken back the same way.
 //
 // What a rollback has to undo is what integrating and deleting change:
 //   - every struct added since the point it rolls back to, which is every
@@ -117,6 +118,10 @@ type applyJournal struct {
 	// because an apply that keeps one is exactly an apply that can be
 	// refused; the document points at it for the decode (Doc.applying).
 	tally applyTally
+	// check is the document's apply check (WithApplyCheck), read once as the
+	// apply begins, so an apply runs a check only beside the journal that can
+	// take back what the check refuses.
+	check func(origin any, view *ApplyView) error
 }
 
 // applyPoint is a point of an apply a rollback can return the document to.
@@ -233,6 +238,7 @@ func beginRemoteApply(txn *Transaction, before StateVector) {
 	if d.refusedContent != nil {
 		j.tally.refusedContent = d.callRefusedContent(txn.Origin)
 	}
+	j.check = d.applyCheck
 }
 
 // pendingMovesAt is the store's pending moves as a point of an apply found
@@ -321,10 +327,11 @@ func ownPendingDs(txn *Transaction, names map[ClientID][]DeleteRange) {
 // parkDeletes merges ds, delete ranges whose targets the store does not hold
 // yet, into the store's pending deletes (StructStore.parkDeletes, which keeps
 // their count), on a bounded document into a set of its own (ownPendingDs).
-// Today no rollback of the whole apply can follow this merge: it is the last
-// step before drainParked, which takes back on its own what it does. The copy
-// guards only a step that can fail being added after it; keep it for that, and
-// do not count on it as more.
+// One step can fail after this merge and roll the whole apply back: the
+// document's apply check of what the update left (checkApply), the last step
+// before drainParked, which takes back on its own what it does. The copy is
+// what lets that rollback give the pending deletes back as the apply found
+// them.
 func parkDeletes(txn *Transaction, ds DeleteSet) {
 	ownPendingDs(txn, ds.clients)
 	txn.doc.store.parkDeletes(ds)
@@ -356,7 +363,9 @@ func refuseRemoteApply(txn *Transaction, err error) error {
 // err as a RefusedUpdateError carrying what the apply's scans passed and what
 // it decoded and added, which no observer reports for a rolled-back
 // transaction (buildPhase2). When it succeeded it keeps the same counts for
-// the report the commit makes (noteApplyReport).
+// the report the commit makes (noteApplyReport), and returns the error of a
+// drain the document's apply check refused (checkDrain), which was taken back
+// while the update stands, or nil.
 //
 // It raises no refusal of its own. The struct and byte budget is read where
 // the apply's struct phase ends (refuseOverBudget), before the delete set
@@ -377,7 +386,9 @@ func endRemoteApply(txn *Transaction, err error) error {
 	}
 	if err == nil {
 		noteApplyReport(txn, j)
-		return err
+		// The update stands; a drain the apply check refused was taken back
+		// (checkDrain), and that is the apply's error.
+		return state.drainRefused
 	}
 	j.rollBack(txn)
 	return &RefusedUpdateError{
@@ -453,11 +464,11 @@ func reportApply(txn *Transaction) {
 // drainParked runs drain, the apply's drain of the pending queue and pending
 // deletes. On a bounded document it is a phase that can fail on its own: under
 // a bound it has an allowance of its own of the bound's size, and under a
-// budget it draws on what the apply's allowance has left. One that fails is
-// taken back to where it began, the pending queue, pending deletes and pending
-// moves are put back as it found them (the queue's clocks raised, parkAgain),
-// and the apply goes on as if the drain had not run; the scans it did stay
-// counted.
+// budget it draws on what the apply's allowance has left. One that fails, or
+// whose result the document's apply check refuses (checkDrain), is taken back
+// to where it began, the pending queue, pending deletes and pending moves are
+// put back as it found them (the queue's clocks raised, parkAgain), and the
+// apply goes on as if the drain had not run; the scans it did stay counted.
 //
 // The queue is put back rather than dropped: a parked item is an edit whose
 // sender was told it was delivered and which the store's state vector does not
@@ -544,6 +555,7 @@ func drainParked(txn *Transaction, drain func()) {
 		// "invalid update" for ever and no way to reach the cause.
 	}()
 	drain()
+	checkDrain(txn, j, &point)
 }
 
 // keepQueueFor records, before a park merges arrivals into the queue the
